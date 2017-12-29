@@ -10,12 +10,13 @@
 
 
 import Reflex
-import Reflex.Dom
+import Reflex.Dom hiding (fromJSString)
 import qualified Data.Map as Map
 import Safe      (readMay)
 import Data.Text (pack, unpack, Text)
 import Control.Applicative ((<*>), (<$>))
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Control.Lens hiding (view)
 import Control.Monad.Fix
 import Control.Monad ((<=<), void, liftM2)
@@ -24,12 +25,18 @@ import Data.Text.Encoding (encodeUtf8)
 import GHC.Generics
 import           Data.Map (Map)
 import qualified Data.Map as Map
-import GHCJS.DOM.Types (JSM)
+import GHCJS.DOM.Types (JSM, liftJSM)
 import System.Random
 import Data.List
 import Control.Monad.IO.Class
 import Data.Foldable
-import Data.Aeson
+import Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy as BL
+import qualified GHCJS.DOM.Storage as GHCJS
+import           GHCJS.DOM.Types (fromJSString, JSString, toJSString, MonadJSM)
+import qualified GHCJS.DOM.Window                  as Window
+import qualified GHCJS.DOM                         as DOM
+import Data.Maybe
 
 
 
@@ -59,17 +66,18 @@ data Config t
 data Model t
   = Model { _ingredients :: Dynamic t (Map IngredientId (Ingredient t))
           , _ingredientCount :: Dynamic t Int
-          , _nextIngredientId :: Behavior t IngredientId
+          , _nextIngredientId :: Dynamic t IngredientId
           }
 
 data ModelDump
-  = ModelDump { _dumpedIngrediants :: Map IngredientId (Text, Float)
+  = ModelDump { _dumpedIngredients :: Map IngredientId (Text, Float)
               , _dumpedCount :: Int
               , _dumpedNextId :: IngredientId
               } deriving (Generic)
 
 instance FromJSON ModelDump
 instance ToJSON ModelDump
+
 
 
 instance Reflex t => Monoid (Config t) where
@@ -89,7 +97,21 @@ instance Reflex t => Switchable t Config where
              <*> switchPromptly never (_onChangedIngredientVal  <$> onConfig)
              <*> switchPromptly never (_onChangeIngredientCount <$> onConfig)
 
+
 -- persistModel :: Model t -> Dynamic t ModelDump
+dumpModel :: forall t. Reflex t => Model t -> Dynamic t ModelDump
+dumpModel model' = do
+    ingredients' <- model'^.ingredients
+    _dumpedIngredients <- sequence $ fmap dumpIngredient ingredients'
+    _dumpedCount <- model'^.ingredientCount
+    _dumpedNextId <- model'^.nextIngredientId
+    pure $ ModelDump {..}
+  where
+   dumpIngredient :: Ingredient t -> Dynamic t (Text, Float)
+   dumpIngredient ingr = do
+     n <- ingr^.ingredientName
+     v <- ingr^.ingredientProbability
+     pure (n, v)
 
 chooseIngredients :: forall t m. MonadWidget t m => Model t -> m (Dynamic t [Dynamic t Text])
 chooseIngredients model' = do
@@ -115,23 +137,42 @@ chooseIngredients model' = do
     calcProb r (iId, ingr) = (iId, (ingr & ingredientProbability %~ fmap (*r)))
 
 
-makeModel :: (MonadWidget t m) => Config t -> m (Model t)
-makeModel conf = mfix $ \model' -> do
+makeModel :: forall t m. (MonadWidget t m) => ModelDump -> Config t -> m (Model t)
+makeModel initialVals conf = mfix $ \model' -> do
+    storage <- Window.getLocalStorage =<< DOM.currentWindowUnchecked
+
+    initIngredients <- fmap Map.fromList . traverse (initIngredient conf model') . Map.toList
+                       $ initialVals^.dumpedIngredients
+
     let onNewIngredient' = pushAlways (const (makeIngredient conf model')) (conf^.onNewIngredient)
-    _ingredients <- foldDyn id Map.empty $ mergeWith (.) [ uncurry Map.insert <$> onNewIngredient'
-                                                         , Map.delete <$> conf^.onRemoveIngredient
-                                                         ]
-    _ingredientCount <- holdDyn 1 $ conf^.onChangeIngredientCount
-    _nextIngredientId <- foldp incId (IngredientId 0) $ conf^.onNewIngredient
+    _ingredients <- foldDyn id initIngredients $ mergeWith (.) [ uncurry Map.insert <$> onNewIngredient'
+                                                               , Map.delete <$> conf^.onRemoveIngredient
+                                                               ]
+    _ingredientCount <- holdDyn (initialVals^.dumpedCount) $ conf^.onChangeIngredientCount
+    _nextIngredientId <- foldDyn incId (initialVals^.dumpedNextId) $ conf^.onNewIngredient
+
+    let
+      onModelDump :: Event t ModelDump
+      onModelDump = updated $ dumpModel model'
+
+      doStore :: ModelDump -> JSM ()
+      doStore = GHCJS.setItem storage ("herbsdata" :: JSString) . toJsonString
+    performEvent_ $ (liftJSM . doStore) <$> onModelDump
     pure $ Model {..}
   where
     incId _ (IngredientId a) = IngredientId (a + 1)
 
+    initIngredient :: Config t -> Model t -> (IngredientId, (Text, Float)) -> m (IngredientId, Ingredient t)
+    initIngredient conf model' (ourId, (initName, initVal)) = do
+      _ingredientName <- holdDyn initName . fmap snd . ffilter ((== ourId) . fst) $ conf^.onChangedIngredientName
+      _ingredientProbability <- holdDyn initVal . fmap snd . ffilter ((== ourId) . fst) $ conf^.onChangedIngredientVal
+      pure $ (ourId, Ingredient {..})
+
 makeIngredient :: (Reflex t, MonadSample t m, MonadHold t m) => Config t -> Model t -> m (IngredientId, Ingredient t)
 makeIngredient conf model' = do
-  ourId <- sample $ model'^.nextIngredientId
+  ourId <- sample . current $ model'^.nextIngredientId
   _ingredientName <- holdDyn "" . fmap snd . ffilter ((== ourId) . fst) $ conf^.onChangedIngredientName
-  _ingredientProbability <- holdDyn 0.0 . fmap snd . ffilter ((== ourId) . fst) $ conf^.onChangedIngredientVal
+  _ingredientProbability <- holdDyn 0 . fmap snd . ffilter ((== ourId) . fst) $ conf^.onChangedIngredientVal
   pure $ (ourId, Ingredient {..})
 {--
 <div class="slidecontainer">
@@ -211,7 +252,13 @@ view model' = do
 
 
 controller :: forall t m. (MonadWidget t m) => m ()
-controller = void . mfix $ view <=< makeModel
+controller = do
+  storage <- Window.getLocalStorage =<< DOM.currentWindowUnchecked
+
+  initialVals <- fromMaybe (ModelDump Map.empty 0 (IngredientId 0))
+                  . (fromJsonString =<<) <$> GHCJS.getItem storage ("herbsdata" :: JSString)
+  -- let initialVals  = ModelDump Map.empty 0 (IngredientId 0)
+  void . mfix $ view <=< makeModel initialVals
 
 main :: IO ()
 main = mainWidgetWithCss (encodeUtf8 css) $ el "div" controller
@@ -259,6 +306,12 @@ css =
    \}"
 
 
+toJsonString :: ToJSON a => a -> JSString
+toJsonString = toJSString . T.decodeUtf8 . BL.toStrict . Aeson.encode
+
+fromJsonString :: FromJSON a => JSString -> Maybe a
+fromJsonString = Aeson.decodeStrict . T.encodeUtf8 . fromJSString
+
 -- Lenses for Ingredient t:
 
 ingredientName :: Lens' (Ingredient t) (Dynamic t Text)
@@ -294,7 +347,20 @@ ingredients f model' = (\ingredients' -> model' { _ingredients = ingredients' })
 ingredientCount :: Lens' (Model t) (Dynamic t Int)
 ingredientCount f model' = (\ingredientCount' -> model' { _ingredientCount = ingredientCount' }) <$> f (_ingredientCount model')
 
-nextIngredientId :: Lens' (Model t) (Behavior t IngredientId)
+nextIngredientId :: Lens' (Model t) (Dynamic t IngredientId)
 nextIngredientId f model' = (\nextIngredientId' -> model' { _nextIngredientId = nextIngredientId' }) <$> f (_nextIngredientId model')
+
+
+
+-- Lenses for ModelDump:
+
+dumpedIngredients :: Lens' ModelDump (Map IngredientId (Text, Float))
+dumpedIngredients f modelDump' = (\dumpedIngredients' -> modelDump' { _dumpedIngredients = dumpedIngredients' }) <$> f (_dumpedIngredients modelDump')
+
+dumpedCount :: Lens' ModelDump Int
+dumpedCount f modelDump' = (\dumpedCount' -> modelDump' { _dumpedCount = dumpedCount' }) <$> f (_dumpedCount modelDump')
+
+dumpedNextId :: Lens' ModelDump IngredientId
+dumpedNextId f modelDump' = (\dumpedNextId' -> modelDump' { _dumpedNextId = dumpedNextId' }) <$> f (_dumpedNextId modelDump')
 
 
