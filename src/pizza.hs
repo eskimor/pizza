@@ -21,18 +21,27 @@ import Control.Monad.Fix
 import Control.Monad ((<=<), void, liftM2)
 import Data.Monoid
 import Data.Text.Encoding (encodeUtf8)
-import Data.Generics
+import GHC.Generics
 import           Data.Map (Map)
 import qualified Data.Map as Map
 import GHCJS.DOM.Types (JSM)
-
+import System.Random
+import Data.List
+import Control.Monad.IO.Class
+import Data.Foldable
+import Data.Aeson
 
 
 
 import Switchable
 
 
-newtype IngredientId = IngredientId Int deriving (Show, Eq, Ord, Read)
+newtype IngredientId = IngredientId Int deriving (Show, Eq, Ord, Read, Generic)
+
+instance FromJSON IngredientId
+instance ToJSON IngredientId
+instance FromJSONKey IngredientId
+instance ToJSONKey IngredientId
 
 data Ingredient t
   = Ingredient { _ingredientName :: Dynamic t Text
@@ -44,20 +53,32 @@ data Config t
            , _onRemoveIngredient :: Event t IngredientId
            , _onChangedIngredientName :: Event t (IngredientId, Text)
            , _onChangedIngredientVal :: Event t  (IngredientId, Float)
+           , _onChangeIngredientCount :: Event t Int
            }
 
 data Model t
   = Model { _ingredients :: Dynamic t (Map IngredientId (Ingredient t))
+          , _ingredientCount :: Dynamic t Int
           , _nextIngredientId :: Behavior t IngredientId
           }
 
+data ModelDump
+  = ModelDump { _dumpedIngrediants :: Map IngredientId (Text, Float)
+              , _dumpedCount :: Int
+              , _dumpedNextId :: IngredientId
+              } deriving (Generic)
+
+instance FromJSON ModelDump
+instance ToJSON ModelDump
+
 
 instance Reflex t => Monoid (Config t) where
-  mempty = Config never never never never
+  mempty = Config never never never never never
   mappend a b = Config { _onNewIngredient = leftmost [_onNewIngredient a, _onNewIngredient b]
                        , _onRemoveIngredient = leftmost [_onRemoveIngredient a, _onRemoveIngredient b]
                        , _onChangedIngredientName = leftmost [_onChangedIngredientName a,  _onChangedIngredientName b]
                        , _onChangedIngredientVal = leftmost [_onChangedIngredientVal a,  _onChangedIngredientVal b]
+                       , _onChangeIngredientCount = leftmost [_onChangeIngredientCount a,  _onChangeIngredientCount b]
                        }
 
 instance Reflex t => Switchable t Config where
@@ -66,6 +87,33 @@ instance Reflex t => Switchable t Config where
              <*> switchPromptly never (_onRemoveIngredient      <$> onConfig)
              <*> switchPromptly never (_onChangedIngredientName <$> onConfig)
              <*> switchPromptly never (_onChangedIngredientVal  <$> onConfig)
+             <*> switchPromptly never (_onChangeIngredientCount <$> onConfig)
+
+-- persistModel :: Model t -> Dynamic t ModelDump
+
+chooseIngredients :: forall t m. MonadWidget t m => Model t -> m (Dynamic t [Dynamic t Text])
+chooseIngredients model' = do
+    gen <- liftIO $ getStdGen
+    let rs = randomRs (0.1, 1.0) gen
+    pure $ chooseIngredients' rs model'
+  where
+    chooseIngredients' :: [Float] -> Model t -> Dynamic t [Dynamic t Text]
+    chooseIngredients' rs model' = do
+      count <- model'^.ingredientCount
+      ingredients' <- model'^.ingredients
+      let
+        ingredientList = Map.toList ingredients'
+
+        calcedListM :: [(IngredientId, Ingredient t)]
+        calcedListM = zipWith calcProb rs ingredientList
+      calcedList <- traverse (traverse (^. ingredientProbability)) $ calcedListM
+      let orderedIds = map fst . take count . sortBy (\a b -> compare (snd b) (snd a)) $ calcedList
+      pure $ map (\iid -> ingredients'^. at iid . _Just . ingredientName) orderedIds
+
+
+    calcProb :: Float -> (IngredientId, Ingredient t) -> (IngredientId, Ingredient t)
+    calcProb r (iId, ingr) = (iId, (ingr & ingredientProbability %~ fmap (*r)))
+
 
 makeModel :: (MonadWidget t m) => Config t -> m (Model t)
 makeModel conf = mfix $ \model' -> do
@@ -73,6 +121,7 @@ makeModel conf = mfix $ \model' -> do
     _ingredients <- foldDyn id Map.empty $ mergeWith (.) [ uncurry Map.insert <$> onNewIngredient'
                                                          , Map.delete <$> conf^.onRemoveIngredient
                                                          ]
+    _ingredientCount <- holdDyn 1 $ conf^.onChangeIngredientCount
     _nextIngredientId <- foldp incId (IngredientId 0) $ conf^.onNewIngredient
     pure $ Model {..}
   where
@@ -101,8 +150,27 @@ viewIngredient ingId ingredient = elClass "div" "ingredient" $ do
     r <- rangeInput $ def & rangeInputConfig_initialValue .~ initVal
                           & rangeInputConfig_setValue .~ updated (_ingredientProbability ingredient)
                           & rangeInputConfig_attributes .~ pure ( "type" =: "range" <> "min" =: "0" <> "max" =: "1" <> "class" =: "slider" <> "step" =: "0.02")
+    x <- button "x"
     pure $ mempty & onChangedIngredientName .~ ((ingId,) <$> t^.textInput_input)
                   & onChangedIngredientVal  .~ ((ingId,) <$> r^.rangeInput_input)
+                  & onRemoveIngredient .~ (const ingId <$> x)
+
+viewCountPicker :: forall t m. (MonadWidget t m) => Model t -> m (Config t)
+viewCountPicker model' = gDyn $ const (viewCountPicker' model') <$> constDyn ()
+
+viewCountPicker' :: (MonadWidget t m) => Model t -> m (Config t)
+viewCountPicker' model' = elClass "div" "ingredient-count-chooser" $ do
+  t <- elClass "span" "count-name" $ text "Number of ingredients"
+  r <- elClass "div" "slidecontainer" $ do
+    initVal <- sample $ current (fromIntegral <$> _ingredientCount model')
+    rangeInput $ def & rangeInputConfig_initialValue .~ initVal
+                          & rangeInputConfig_setValue .~ fmap fromIntegral (updated (_ingredientCount model'))
+                          & rangeInputConfig_attributes .~ pure ( "type" =: "range" <> "min" =: "1" <> "max" =: "15" <> "class" =: "slider" <> "step" =: "1")
+  elClass "div" "count-chooser-show-val" $ do
+    text "You lucky guy, get "
+    dynText (T.pack . show <$> model'^.ingredientCount)
+    text " ingredients on your pizza!"
+  pure $ mempty & onChangeIngredientCount .~ fmap round (r^.rangeInput_input)
 
 viewIngredients :: forall t m. MonadWidget t m => Model t -> m (Config t)
 viewIngredients model' = do
@@ -120,8 +188,26 @@ viewIngredients model' = do
     viewIngredients' = fmap mconcat . traverse (uncurry viewIngredient)  . Map.toList
 
 
-view :: (MonadWidget t m) => Model t -> m (Config t)
-view = viewIngredients
+view :: forall t m. (MonadWidget t m) => Model t -> m (Config t)
+view model' = do
+  c1 <- viewIngredients model'
+  c2 <- do
+    el "br" blank
+    el "h1" $ text "How many ingredients for your pizza?"
+    viewCountPicker model'
+
+  ingredients' <- chooseIngredients model'
+  el "div" $ do
+    el "h1" $ text "Your pizza ingredients"
+  el "ul" $ do
+    void $ dyn $ viewAllChosen <$> ingredients'
+  pure $ c1 <> c2
+  where
+    viewAllChosen :: [Dynamic t Text] -> m ()
+    viewAllChosen = traverse_ viewChosen
+
+    viewChosen :: Dynamic t Text -> m ()
+    viewChosen = el "li" . dynText
 
 
 controller :: forall t m. (MonadWidget t m) => m ()
@@ -136,6 +222,7 @@ foldp = accumB . flip
 css :: Text
 css =
   "\
+   \h1 { font-size: 14pt;}\
    \.slidecontainer {\
    \width: 100%; /* Width of the outside container */\
    \}\
@@ -171,6 +258,7 @@ css =
    \    cursor: pointer; /* Cursor on hover */\
    \}"
 
+
 -- Lenses for Ingredient t:
 
 ingredientName :: Lens' (Ingredient t) (Dynamic t Text)
@@ -194,11 +282,17 @@ onChangedIngredientName f config' = (\onChangedIngredientName' -> config' { _onC
 onChangedIngredientVal :: Lens' (Config t) (Event t (IngredientId, Float))
 onChangedIngredientVal f config' = (\onChangedIngredientVal' -> config' { _onChangedIngredientVal = onChangedIngredientVal' }) <$> f (_onChangedIngredientVal config')
 
+onChangeIngredientCount :: Lens' (Config t) (Event t Int)
+onChangeIngredientCount f config' = (\onChangeIngredientCount' -> config' { _onChangeIngredientCount = onChangeIngredientCount' }) <$> f (_onChangeIngredientCount config')
+
 
 -- Lenses for Model t:
 
 ingredients :: Lens' (Model t) (Dynamic t (Map IngredientId (Ingredient t)))
 ingredients f model' = (\ingredients' -> model' { _ingredients = ingredients' }) <$> f (_ingredients model')
+
+ingredientCount :: Lens' (Model t) (Dynamic t Int)
+ingredientCount f model' = (\ingredientCount' -> model' { _ingredientCount = ingredientCount' }) <$> f (_ingredientCount model')
 
 nextIngredientId :: Lens' (Model t) (Behavior t IngredientId)
 nextIngredientId f model' = (\nextIngredientId' -> model' { _nextIngredientId = nextIngredientId' }) <$> f (_nextIngredientId model')
